@@ -3,6 +3,14 @@
 
 #include "domain_conf.h"
 
+typedef struct _acrnMonitor acrnMonitor;
+typedef acrnMonitor *acrnMonitorPtr;
+struct _acrnMonitor {
+    int fd;
+    virDomainObjPtr vm;
+    virMutex lock;
+};
+
 typedef struct _acrnDomainObjPrivate acrnDomainObjPrivate;
 typedef acrnDomainObjPrivate *acrnDomainObjPrivatePtr;
 struct _acrnDomainObjPrivate {
@@ -13,6 +21,10 @@ struct _acrnDomainObjPrivate {
         char *slave;
     } ttys[4];
     size_t nttys;
+
+    virDomainChrSourceDefPtr monConfig;
+    char *libDir;            /* base path for per-domain files */
+    acrnMonitorPtr mon;
 };
 
 typedef struct _acrnDomainXmlNsDef acrnDomainXmlNsDef;

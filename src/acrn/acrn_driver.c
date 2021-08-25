@@ -26,6 +26,7 @@
 #include "acrn_common.h"
 #include "acrn_driver.h"
 #include "acrn_domain.h"
+#include "virtime.h"
 
 #define VIR_FROM_THIS VIR_FROM_ACRN
 #define ACRN_DM_PATH            "/usr/bin/acrn-dm"
@@ -35,8 +36,11 @@
 #define ACRN_AUTOSTART_DIR      SYSCONFDIR "/libvirt/acrn/autostart"
 #define ACRN_CONFIG_DIR         SYSCONFDIR "/libvirt/acrn"
 #define ACRN_STATE_DIR          RUNSTATEDIR "/libvirt/acrn"
+#define ACRN_MONITOR_DIR        LOCALSTATEDIR "/lib/libvirt/acrn"
 #define ACRN_NET_GENERATED_TAP_PREFIX   "tap"
 #define ACRN_PI_VERSION         (0x100)
+
+#define ACRN_DEFAULT_MONITOR_WAIT 30
 
 VIR_LOG_INIT("acrn.acrn_driver");
 
@@ -584,6 +588,17 @@ acrnSetOnlineVcpus(virDomainDefPtr def, virBitmapPtr vcpus)
     return virDomainDefSetVcpus(def, virBitmapCountBits(vcpus));
 }
 
+int
+acrnProcessPrepareMonitorChr(virDomainChrSourceDefPtr monConfig,
+                             const char *domainDir)
+{
+    monConfig->type = VIR_DOMAIN_CHR_TYPE_UNIX;
+    monConfig->data.nix.listen = true;
+
+    monConfig->data.nix.path = g_strdup_printf("%s/monitor.sock", domainDir);
+    return 0;
+}
+
 static int
 acrnProcessPrepareDomain(virDomainObjPtr vm, acrnPlatformInfoPtr pi,
                          struct acrnVmEntry *entry, size_t *allocMap)
@@ -638,6 +653,14 @@ acrnProcessPrepareDomain(virDomainObjPtr vm, acrnPlatformInfoPtr pi,
         acrnFreeVcpus(priv->cpuAffinitySet, allocMap);
         goto cleanup;
     }
+    if (!priv->libDir)
+        priv->libDir = g_strdup_printf("%s/domain-%s", ACRN_MONITOR_DIR, vm->def->name);
+    if (!(priv->monConfig = virDomainChrSourceDefNew(acrn_driver->xmlopt)))
+        return -1;
+    VIR_DEBUG("Preparing monitor state");
+    if (acrnProcessPrepareMonitorChr(priv->monConfig, priv->libDir) < 0)
+        return -1;
+    VIR_DEBUG("Monitor UNIX socket path:%s", priv->monConfig->data.nix.path);
 
     ret = 0;
 
@@ -1117,7 +1140,122 @@ acrnBuildStartCmd(virDomainObjPtr vm)
 
     return cmd;
 }
+static int
+acrnMonitorIOWriteWithFD(acrnMonitorPtr mon,
+                         const char *data,
+                         size_t len,
+                         int fd)
+{
+    struct msghdr msg;
+    struct iovec iov[1];
+    int ret;
+    char control[CMSG_SPACE(sizeof(int))];
+    struct cmsghdr *cmsg;
 
+    memset(&msg, 0, sizeof(msg));
+    memset(control, 0, sizeof(control));
+
+    iov[0].iov_base = (void *)data;
+    iov[0].iov_len = len;
+
+    msg.msg_iov = iov;
+    msg.msg_iovlen = 1;
+
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+
+    cmsg = CMSG_FIRSTHDR(&msg);
+    /* Some static analyzers, like clang 2.6-0.6.pre2, fail to see
+       that our use of CMSG_FIRSTHDR will not return NULL.  */
+    sa_assert(cmsg);
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
+
+    do {
+        ret = sendmsg(mon->fd, &msg, 0);
+    } while (ret < 0 && errno == EINTR);
+
+    return ret;
+}
+static int
+acrnMonitorOpenUnix(const char *monitor)
+{
+    struct sockaddr_un addr;
+    int monfd;
+    int ret = -1;
+    virTimeBackOffVar timebackoff;
+
+    if ((monfd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
+        virReportSystemError(errno,
+                             "%s", _("failed to create socket"));
+        return -1;
+    }
+    VIR_DEBUG("acrnMonitorOpenUnix:create sock");
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    if (virStrcpyStatic(addr.sun_path, monitor) < 0) {
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       _("Monitor path %s too big for destination"), monitor);
+        goto error;
+    }
+    if (virTimeBackOffStart(&timebackoff, 1, ACRN_DEFAULT_MONITOR_WAIT * 1000) < 0)
+            goto error;
+    while (virTimeBackOffWait(&timebackoff)) {
+        ret = connect(monfd, (struct sockaddr *) &addr, sizeof(addr));
+        if (ret == 0)
+                break;
+
+        if (errno == ENOENT || errno == ECONNREFUSED) {
+            /* ENOENT       : Socket may not have shown up yet
+                * ECONNREFUSED : Leftover socket hasn't been removed yet */
+                continue;
+        }
+        virReportSystemError(errno, "%s",
+                        _("failed to connect to monitor socket"));
+        goto error;
+    }
+    VIR_DEBUG("acrnMonitorOpenUnix:connect to monitor sock:fd=%d", monfd);
+    return monfd;
+
+ error:
+    VIR_FORCE_CLOSE(monfd);
+    return -1;
+}
+static void
+acrnMonitorClose(acrnMonitorPtr mon)
+{
+    if (!mon)
+        return;
+    virMutexLock(&mon->lock);
+    if (mon->fd >= 0) {
+        VIR_FORCE_CLOSE(mon->fd);
+    }
+    virMutexUnlock(&mon->lock);
+}
+static int
+acrnProcessWaitForMonitor(virDomainObjPtr vm)
+{
+    acrnDomainObjPrivatePtr priv = vm->privateData;
+    virDomainChrSourceDefPtr config = priv->monConfig;
+    acrnMonitorPtr acrn_mon = NULL;
+    VIR_DEBUG("acrnProcessWaitForMonitor:start");
+    int fd = -1;
+    fd = acrnMonitorOpenUnix(config->data.nix.path);
+    if (VIR_ALLOC(acrn_mon) < 0)
+        return -1;
+    if (virMutexInit(&acrn_mon->lock) < 0) {
+        VIR_FREE(acrn_mon);
+        return -1;
+    }
+    acrn_mon->fd = fd;
+    acrn_mon->vm = virObjectRef(vm);
+
+    priv->mon = acrn_mon;
+    VIR_DEBUG("acrnProcessWaitForMonitor:end");
+    return fd;
+}
 static int
 acrnProcessStart(virDomainObjPtr vm)
 {
@@ -1140,6 +1278,11 @@ acrnProcessStart(virDomainObjPtr vm)
         vm->def->id = 0;
 
     virDomainObjSetState(vm, VIR_DOMAIN_RUNNING, VIR_DOMAIN_RUNNING_BOOTED);
+
+    VIR_DEBUG("Waiting for monitor to show up");
+    if (acrnProcessWaitForMonitor(vm) < 0)
+        goto cleanup;
+
     ret = 0;
 
 cleanup:
@@ -1205,7 +1348,7 @@ acrnAutostartDomains(acrnConnectPtr driver, struct acrnVmList *vmlist)
     virObjectUnref(conn);
 }
 static virCommandPtr
-acrnBuildStopCmd(virDomainDefPtr def)
+acrnBuildStopCmd(virDomainDefPtr def, virDomainObjPtr vm)
 {
     virCommandPtr cmd;
 
@@ -1214,26 +1357,40 @@ acrnBuildStopCmd(virDomainDefPtr def)
 
     if (!(cmd = virCommandNewArgList(ACRN_CTL_PATH, "stop", "-f",
                                      def->name, NULL)))
-        virReportError(VIR_ERR_NO_MEMORY, NULL);
-
     return cmd;
 }
+int
+acrnMonitorSystemPowerdown(acrnMonitorPtr mon)
+{
+    char cmd_name[10] = "shutdown";
+    int ret;
 
+    if (!mon)
+        return -1;
+
+    ret = acrnMonitorIOWriteWithFD(mon, cmd_name, sizeof(cmd_name), mon->fd);
+    return ret;
+}
+static int
+acrnDomainShutdownMonitor(virDomainObjPtr vm)
+{
+    acrnDomainObjPrivatePtr priv = vm->privateData;
+
+    return acrnMonitorSystemPowerdown(priv->mon);
+}
 static int
 acrnProcessStop(virDomainObjPtr vm, int reason, size_t *allocMap)
 {
     virDomainDefPtr def = vm->def;
-    virCommandPtr cmd;
     acrnDomainObjPrivatePtr priv = vm->privateData;
     int ret = -1;
 
-    if (!(cmd = acrnBuildStopCmd(def)))
-        goto cleanup;
-
     VIR_DEBUG("Stopping domain '%s'", def->name);
 
-    if (virCommandRun(cmd, NULL) < 0)
+    if (acrnDomainShutdownMonitor(vm) < 0) {
+        VIR_DEBUG("Fail to stop domain '%s'", def->name);
         goto cleanup;
+    }
 
     /* clean up network interfaces */
     acrnNetCleanup(vm);
@@ -1241,13 +1398,20 @@ acrnProcessStop(virDomainObjPtr vm, int reason, size_t *allocMap)
     /* clean up ttys */
     acrnTtyCleanup(vm);
 
+    acrnMonitorClose(priv->mon);
+    if (priv->monConfig) {
+        if (priv->monConfig->type == VIR_DOMAIN_CHR_TYPE_UNIX)
+            unlink(priv->monConfig->data.nix.path);
+        virObjectUnref(priv->monConfig);
+        priv->monConfig = NULL;
+    }
+
     virDomainObjSetState(vm, VIR_DOMAIN_SHUTOFF, reason);
 
     def->id = -1;
     ret = 0;
 
 cleanup:
-    virCommandFree(cmd);
     acrnFreeVcpus(priv->cpuAffinitySet, allocMap);
     return ret;
 }
@@ -2953,6 +3117,12 @@ acrnStateInitialize(bool privileged,
 	    virReportSystemError(errno,
 			                _("Failed to mkdir %s"),
 			                ACRN_STATE_DIR);
+	    goto cleanup;
+    }
+    if (virFileMakePath(ACRN_MONITOR_DIR) < 0) {
+	    virReportSystemError(errno,
+			                _("Failed to mkdir %s"),
+			                ACRN_MONITOR_DIR);
 	    goto cleanup;
     }
 
