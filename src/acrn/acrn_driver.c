@@ -26,6 +26,7 @@
 #include "acrn_common.h"
 #include "acrn_driver.h"
 #include "acrn_domain.h"
+#include "acrn_monitor.h"
 
 #define VIR_FROM_THIS VIR_FROM_ACRN
 #define ACRN_DM_PATH            "/usr/bin/acrn-dm"
@@ -35,6 +36,7 @@
 #define ACRN_AUTOSTART_DIR      SYSCONFDIR "/libvirt/acrn/autostart"
 #define ACRN_CONFIG_DIR         SYSCONFDIR "/libvirt/acrn"
 #define ACRN_STATE_DIR          RUNSTATEDIR "/libvirt/acrn"
+#define ACRN_MONITOR_DIR        LOCALSTATEDIR "/lib/libvirt/acrn"
 #define ACRN_NET_GENERATED_TAP_PREFIX   "tap"
 #define ACRN_PI_VERSION         (0x100)
 
@@ -585,6 +587,17 @@ acrnSetOnlineVcpus(virDomainDefPtr def, virBitmapPtr vcpus)
     return virDomainDefSetVcpus(def, virBitmapCountBits(vcpus));
 }
 
+int
+acrnProcessPrepareMonitorChr(virDomainChrSourceDefPtr monConfig,
+                             const char *domainDir)
+{
+    monConfig->type = VIR_DOMAIN_CHR_TYPE_UNIX;
+    monConfig->data.nix.listen = true;
+
+    monConfig->data.nix.path = g_strdup_printf("%s/monitor.sock", domainDir);
+    return 0;
+}
+
 static int
 acrnProcessPrepareDomain(virDomainObjPtr vm, acrnPlatformInfoPtr pi,
                          struct acrnVmEntry *entry, size_t *allocMap)
@@ -1120,6 +1133,36 @@ acrnBuildStartCmd(virDomainObjPtr vm)
 }
 
 static int
+acrnProcessWaitForMonitor(virDomainObjPtr vm)
+{
+    acrnDomainObjPrivatePtr priv = vm->privateData;
+    virDomainChrSourceDefPtr config = priv->monConfig;
+    acrnMonitorPtr acrn_mon = NULL;
+    int fd = -1;
+    if (!priv->libDir)
+        priv->libDir = g_strdup_printf("%s/domain-%s", ACRN_MONITOR_DIR, vm->def->name);
+    if (!(config = virDomainChrSourceDefNew(acrn_driver->xmlopt)))
+        return -1;
+    VIR_DEBUG("Preparing monitor state");
+    if (acrnProcessPrepareMonitorChr(config, priv->libDir) < 0)
+        return -1;
+    VIR_DEBUG("Monitor UNIX socket path:%s", config->data.nix.path);
+
+    fd = acrnMonitorOpenUnix(config->data.nix.path);
+    if (VIR_ALLOC(acrn_mon) < 0)
+        return -1;
+    if (virMutexInit(&acrn_mon->lock) < 0) {
+        VIR_FREE(acrn_mon);
+        return -1;
+    }
+    acrn_mon->fd = fd;
+    acrn_mon->vm = virObjectRef(vm);
+
+    priv->mon = acrn_mon;
+    VIR_DEBUG("acrnProcessWaitForMonitor:end");
+    return fd;
+}
+static int
 acrnProcessStart(virDomainObjPtr vm)
 {
     virCommandPtr cmd;
@@ -1141,6 +1184,15 @@ acrnProcessStart(virDomainObjPtr vm)
         vm->def->id = 0;
 
     virDomainObjSetState(vm, VIR_DOMAIN_RUNNING, VIR_DOMAIN_RUNNING_BOOTED);
+
+    VIR_DEBUG("Waiting for monitor to show up");
+    if (acrnProcessWaitForMonitor(vm) < 0)
+        goto cleanup;
+
+    if (virDomainObjSave(vm, acrn_driver->xmlopt,
+                         ACRN_STATE_DIR) < 0)
+        goto cleanup;
+
     ret = 0;
 
 cleanup:
@@ -1206,7 +1258,7 @@ acrnAutostartDomains(acrnConnectPtr driver, struct acrnVmList *vmlist)
     virObjectUnref(conn);
 }
 static virCommandPtr
-acrnBuildStopCmd(virDomainDefPtr def)
+acrnBuildStopCmd(virDomainDefPtr def, virDomainObjPtr vm)
 {
     virCommandPtr cmd;
 
@@ -1215,26 +1267,29 @@ acrnBuildStopCmd(virDomainDefPtr def)
 
     if (!(cmd = virCommandNewArgList(ACRN_CTL_PATH, "stop", "-f",
                                      def->name, NULL)))
-        virReportError(VIR_ERR_NO_MEMORY, NULL);
-
     return cmd;
 }
 
 static int
+acrnDomainShutdownMonitor(virDomainObjPtr vm)
+{
+    acrnDomainObjPrivatePtr priv = vm->privateData;
+
+    return acrnMonitorSystemPowerdown(priv->mon);
+}
+static int
 acrnProcessStop(virDomainObjPtr vm, int reason, size_t *allocMap)
 {
     virDomainDefPtr def = vm->def;
-    virCommandPtr cmd;
     acrnDomainObjPrivatePtr priv = vm->privateData;
     int ret = -1;
 
-    if (!(cmd = acrnBuildStopCmd(def)))
-        goto cleanup;
-
     VIR_DEBUG("Stopping domain '%s'", def->name);
 
-    if (virCommandRun(cmd, NULL) < 0)
+    if (acrnDomainShutdownMonitor(vm) < 0) {
+        VIR_DEBUG("Fail to stop domain '%s'", def->name);
         goto cleanup;
+    }
 
     /* clean up network interfaces */
     acrnNetCleanup(vm);
@@ -1242,13 +1297,20 @@ acrnProcessStop(virDomainObjPtr vm, int reason, size_t *allocMap)
     /* clean up ttys */
     acrnTtyCleanup(vm);
 
+    acrnMonitorClose(priv->mon);
+    if (priv->monConfig) {
+        if (priv->monConfig->type == VIR_DOMAIN_CHR_TYPE_UNIX)
+            unlink(priv->monConfig->data.nix.path);
+        virObjectUnref(priv->monConfig);
+        priv->monConfig = NULL;
+    }
+
     virDomainObjSetState(vm, VIR_DOMAIN_SHUTOFF, reason);
 
     def->id = -1;
     ret = 0;
 
 cleanup:
-    virCommandFree(cmd);
     acrnFreeVcpus(priv->cpuAffinitySet, allocMap);
     return ret;
 }
@@ -2883,7 +2945,33 @@ acrnPersistentDomainInit(virDomainObjPtr dom, void *opaque)
     virObjectEventStateQueue(acrn_driver->domainEventState, event);
     return 0;
 }
+struct acrnProcessReconnectData {
+    acrnConnectPtr driver;
+};
+static int
+viracrnProcessReconnect(virDomainObjPtr vm,
+                         void *opaque)
+{
+    acrnDomainObjPrivatePtr priv = vm->privateData;
+    int ret = -1;
+    if (!virDomainObjIsActive(vm))
+        return 0;
+    VIR_DEBUG("ACRN driver try to reconnect %s\n", vm->def->name);
 
+    if (acrnProcessWaitForMonitor(vm) < 0)
+        goto cleanup;
+    ret = 0;
+cleanup:
+    return ret;
+}
+void
+viracrnProcessReconnectAll(acrnConnectPtr driver)
+{
+    struct acrnProcessReconnectData data;
+    data.driver = driver;
+    virDomainObjListForEach(driver->domains, false, viracrnProcessReconnect, &data);
+    return;
+}
 static virDrvStateInitResult
 acrnStateInitialize(bool privileged,
                     const char *root,
@@ -2956,6 +3044,12 @@ acrnStateInitialize(bool privileged,
 			                ACRN_STATE_DIR);
 	    goto cleanup;
     }
+    if (virFileMakePath(ACRN_MONITOR_DIR) < 0) {
+	    virReportSystemError(errno,
+			                _("Failed to mkdir %s"),
+			                ACRN_MONITOR_DIR);
+	    goto cleanup;
+    }
 
     if (virDomainObjListLoadAllConfigs(acrn_driver->domains,
                                        ACRN_STATE_DIR,
@@ -2974,6 +3068,8 @@ acrnStateInitialize(bool privileged,
     if (virDomainObjListForEach(acrn_driver->domains, false,
                                 acrnPersistentDomainInit, list) < 0)
         goto cleanup;
+
+    viracrnProcessReconnectAll(acrn_driver);
 
     if (virDriverShouldAutostart(ACRN_STATE_DIR, &autostart) < 0)
         goto cleanup;
